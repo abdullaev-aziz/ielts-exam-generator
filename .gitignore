@@ -1,0 +1,19 @@
+# Generated audio output
+*.wav
+!narrator_ref.wav
+tts_events1.json
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+
+# IDE
+.idea/
+
+# Environment
+.env
+
+# Jupyter
+.ipynb_checkpoints/

@@ -1,0 +1,20 @@
+{
+  "version": 1,
+  "skills": {
+    "openai-agents-sdk-guidelines": {
+      "source": "flurin17/openai-agents-guidelines",
+      "sourceType": "github",
+      "computedHash": "5574d2f89f413266cd6bd2512ce8f841e5d3921d3580093fe2b8312f70c14ac6"
+    },
+    "qwen3-tts-skills": {
+      "source": "mu-zi-lee/qwen3-tts-skill",
+      "sourceType": "github",
+      "computedHash": "24e9c2163920c23a3b1d2e7812a2fc09f73c6b6a35fe73f3fcf8a61c01316a21"
+    },
+    "using-superpowers": {
+      "source": "obra/superpowers",
+      "sourceType": "github",
+      "computedHash": "5ed84a512f8664cc440ff26b19a0087eae6b2979e9e79cb26366b7f7b134e758"
+    }
+  }
+}
