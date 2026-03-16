@@ -16,11 +16,22 @@ source .venv/bin/activate
 # It is a 3–10s clean audio sample of a British narrator voice used for voice cloning.
 # See "narrator_ref.wav" section below.
 
-# Run the full Part 1 pipeline — generates content AND audio in one command (requires GPU)
-python "listening/agents/part1/main agent.py"
-# Outputs: tts_events.json (backup) + ielts_part1.wav
+# --- NATS server mode (primary way to run) ---
+# Start the NATS server first (must be running on localhost:4222)
+# Then start the IELTS generation server:
+python nats_server.py
+# Listens on subject 'ielts.generate'. Publishes progress to 'ielts.result.{job_id}'.
 
-# Retry audio generation from a saved JSON (skip agents, GPU only)
+# Send a test job (in another terminal):
+python nats_client.py
+# Prints job_id, then streams status/questions/audio/validation events as they arrive.
+
+# --- Standalone pipeline (no NATS) ---
+# run_pipeline() in main_agent.py can be called directly from Python:
+#   from listening.agents.part1.main_agent import run_pipeline
+#   cdn_url = asyncio.run(run_pipeline())
+
+# Retry audio generation from a saved JSON (skip agents, saves locally — GPU only)
 python ielts_audio_generator.py tts_events.json
 
 # Run individual agents
@@ -37,27 +48,42 @@ This file is a required asset committed to git. It is a short (3–10s) clean au
 2. Save as `narrator_ref.wav` in the project root
 3. Optionally create `narrator_ref.txt` with the transcript of that clip (improves clone quality)
 
-### Generated files (gitignored)
+### Generated files
 
-`*.wav` (except `narrator_ref.wav`) and `tts_events.json` are gitignored. They are produced by the pipeline and should not be committed.
+The pipeline no longer writes local WAV or JSON files. Audio is rendered in memory and uploaded directly to S3. The S3 key format is `dev/ielts/part1/ielts_part1_{YYYYMMDD_HHMMSS}.wav` — each run gets a unique timestamped name.
 
 ## Architecture
 
-The system uses a **sequential agent pipeline** orchestrated by `listening/agents/part1/main agent.py`:
+The system uses a **sequential agent pipeline** orchestrated by `listening/agents/part1/main_agent.py`:
 
 1. **Agent 1** (`agent1.py`) — Blueprint/skeleton generator. Creates an `IELTSBlueprint` Pydantic model with scenario, speakers, question groups, and planned answer fields. This is the most complete agent with a detailed prompt.
 2. **Agent 2** (`agent2.py`) — Question & answer writer. Takes the `IELTSBlueprint` from Agent 1 and generates 10 concrete questions, answers with distractors, and a full natural dialogue. Outputs an `IELTSQuestionSet` Pydantic model. Uses Cambridge distractor techniques (correction traps, spelling protocol, number confusion, decoy alternatives).
 3. **Agent 3** (`agent3.py`) — TTS script generator. Takes the `IELTSQuestionSet` from Agent 2 and blueprint speaker info from Agent 1, and produces an `IELTSTTSScript` — a complete ordered list of speech and silence events matching the IELTS Part 1 audio structure. Uses semantic `SilenceType` labels (not hardcoded durations). Applies Qwen3-TTS text formatting (ellipsis for pauses, em-dash spelling sequences, filler preservation). The `to_events()` method converts the Pydantic output to the `[(speaker, text), (None, duration)]` tuple format consumed by the audio generator.
 4. **Agent 4** (`agent4.py`) — Quality checker/validator. Validates IELTS compliance. (Stub.)
 
-Agents use the OpenAI SDK (configured in `config.py`) via the `agents` framework (`await Runner.run()`). The pipeline is async — `main agent.py` runs via `asyncio.run(main())` and calls `asyncio.to_thread(generate_audio, ...)` to offload blocking GPU work without blocking the event loop. Prompts live in `prompts.py`.
+Agents use the OpenAI SDK (configured in `config.py`) via the `agents` framework (`await Runner.run()`). The pipeline is exposed as `async run_pipeline(on_progress=None) → str` in `main_agent.py`. It calls `asyncio.to_thread(generate_and_upload_to_s3, ...)` to offload blocking GPU work. Prompts live in `prompts.py`.
 
-**TTS audio generator** (`ielts_audio_generator.py`): Exposes `generate_audio(script: IELTSTTSScript, out_wav: str)` — called directly by `main agent.py` after the pipeline so no JSON round-trip is needed. Can also run standalone: `python ielts_audio_generator.py tts_events.json`. Uses Qwen3-TTS with voice cloning, speaker-specific voice design, silence trimming, and micro-pauses. TTS models are **lazy-loaded** on first use (not at import time) via `_ensure_initialized()` — importing the module does not allocate GPU memory.
+**NATS interface** (`nats_server.py` / `nats_client.py`): The primary runtime mode.
+- `nats_server.py` — subscribes to `ielts.generate`; on each request, immediately responds with `{"job_id": "..."}` and spawns a background task (`run_job`) that calls `run_pipeline(on_progress=publish)`. Progress events are published to `ielts.result.{job_id}` with types: `status`, `questions`, `audio`, `validation`, `error`. Final event always includes `"done": true`.
+- `nats_client.py` — test client: sends a request to `ielts.generate`, then subscribes to `ielts.result.{job_id}` and prints each event until `done`.
+- NATS server must be running on `localhost:4222`.
+
+**TTS audio generator** (`ielts_audio_generator.py`): Two public entry points:
+- `_render_audio(script)` — private helper, renders TTS events to a numpy array in memory
+- `generate_and_upload_to_s3(script, s3_key) → str` — renders in memory via `BytesIO`, uploads directly to S3 via `put_object`, returns the CDN URL. Called by `main_agent.py` — no local files written.
+
+Uses Qwen3-TTS with voice cloning, speaker-specific voice design, silence trimming, and micro-pauses. TTS models are **lazy-loaded** on first use (not at import time) via `_ensure_initialized()` — importing the module does not allocate GPU memory.
 
 ## Key Configuration
 
-- `listening/agents/part1/config.py` — API key (from `OPENAI_API_KEY` env var), model name (`gpt-5-mini-2025-08-07`), retry settings
-- `.env` — Environment variables for API keys (gitignored)
+- `listening/agents/part1/config.py` — API key (from `OPENAI_API_KEY` env var), model name (`gpt-5.4-2026-03-05`)
+- `.env` — Environment variables for API keys and S3 config (gitignored). Required S3 vars:
+  - `S3_ENDPOINT_URL` — custom S3-compatible endpoint
+  - `S3_REGION` — storage region
+  - `S3_ACCESS_KEY_ID` / `S3_SECRET_ACCESS_KEY` — credentials
+  - `S3_BUCKET_NAME` — target bucket
+  - `S3_BASE_FOLDER` — key prefix (default: `dev/ielts`)
+  - `S3_CDN_BASE_URL` — CDN base for returned URLs
 - `listening/agents/part1/prompts.py` — All agent system prompts (Agents 1, 2, and 3 are populated)
 
 ## Data Models
@@ -70,7 +96,9 @@ Pydantic models in `agent3.py`: `IELTSTTSScript`, `TTSEvent`, `EventType` (speec
 
 ## Dependencies
 
-Key packages: `openai`, `openai-agents` (agent orchestration framework), `qwen-tts`, `torch`, `soundfile`, `numpy`, `pydantic`. Python 3.13.3. Pinned versions are in `requirements.txt`.
+Key packages: `openai`, `openai-agents` (agent orchestration framework), `qwen-tts`, `torch`, `soundfile`, `numpy`, `pydantic`, `boto3` (S3 uploads), `nats-py` (NATS messaging), `python-dotenv` (env loading). Python 3.13.3. Pinned versions are in `requirements.txt`.
+
+Note: `nats-py` and `python-dotenv` are used by `nats_server.py` but are not yet listed in `requirements.txt` — install manually if needed: `pip install nats-py python-dotenv`.
 
 ```bash
 pip install -r requirements.txt

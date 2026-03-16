@@ -1,9 +1,10 @@
+import io
 import os
-import sys
-import json
 import numpy as np
 import torch
 import soundfile as sf
+import boto3
+from botocore.config import Config
 from qwen_tts import Qwen3TTSModel
 from listening.agents.part1.agent3 import IELTSTTSScript
 
@@ -188,29 +189,26 @@ def trim_audio_edges(
     return wav[start:end]
 
 
-def generate_audio(script: IELTSTTSScript, out_wav: str = OUT_WAV) -> None:
-    """Generate a WAV file from an IELTSTTSScript produced by the agent pipeline."""
+def _render_audio(script: IELTSTTSScript):
+    """Render all TTS events and return (combined_array, sample_rate)."""
     _ensure_initialized()
     events = script.to_events()
 
     print("Starting audio generation...")
     print(f"Total events: {len(events)}\n")
 
-    # Get sample rate from first generation
     tmp_wav, sr = tts_line("Test.", NARRATOR)
     print(f"Sample rate: {sr} Hz\n")
 
     segments = []
 
     for idx, event in enumerate(events, 1):
-        # Silence event
         if event[0] is None:
             duration = event[1]
             segments.append(silence(sr, duration))
             print(f"[{idx}/{len(events)}] Silence: {duration:.1f}s")
             continue
 
-        # Speech event
         speaker, text = event
         print(f"[{idx}/{len(events)}] {speaker}: {text[:60]}{'...' if len(text) > 60 else ''}")
 
@@ -218,24 +216,37 @@ def generate_audio(script: IELTSTTSScript, out_wav: str = OUT_WAV) -> None:
         wav = trim_audio_edges(wav, sr)
         segments.append(wav)
 
-        # Add micro-pause only when next event is also speech.
         if idx < len(events):
             next_event = events[idx]
             if next_event[0] is not None:
                 pause = PAUSE_NARR if speaker == NARRATOR else PAUSE_TURN
                 segments.append(silence(sr, pause))
 
-    # Combine and save
-    combined = np.concatenate(segments)
-    sf.write(out_wav, combined, sr)
+    return np.concatenate(segments), sr
+
+
+def generate_and_upload_to_s3(script: IELTSTTSScript, s3_key: str) -> str:
+    """Render audio in memory and upload directly to S3. Returns the CDN URL."""
+    combined, sr = _render_audio(script)
+
+    buf = io.BytesIO()
+    sf.write(buf, combined, sr, format="WAV")
+    wav_bytes = buf.getvalue()
+
+    client = boto3.client(
+        "s3",
+        endpoint_url=os.getenv("S3_ENDPOINT_URL"),
+        region_name=os.getenv("S3_REGION", "us-east-1"),
+        aws_access_key_id=os.getenv("S3_ACCESS_KEY_ID"),
+        aws_secret_access_key=os.getenv("S3_SECRET_ACCESS_KEY"),
+        config=Config(s3={"addressing_style": "path"}),
+    )
+    bucket = os.getenv("S3_BUCKET_NAME")
+    client.put_object(Bucket=bucket, Key=s3_key, Body=wav_bytes, ContentType="audio/wav")
+
+    cdn_base = os.getenv("S3_CDN_BASE_URL", "").rstrip("/")
+    cdn_url = f"{cdn_base}/{s3_key}"
 
     duration_min = combined.shape[0] / sr / 60
-    print(f"\n✓ Successfully created: {out_wav}")
-    print(f"  Duration: {duration_min:.2f} minutes")
-
-
-if __name__ == "__main__":
-    tts_events_json = sys.argv[1] if len(sys.argv) > 1 else "tts_events.json"
-    with open(tts_events_json) as f:
-        script = IELTSTTSScript.model_validate(json.load(f))
-    generate_audio(script)
+    print(f"\n✓ Uploaded to S3: {cdn_url}  ({duration_min:.2f} min)")
+    return cdn_url
