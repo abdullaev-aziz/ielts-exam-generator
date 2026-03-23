@@ -1,9 +1,11 @@
-from agents import Agent
-from config import MODEL
-from prompts import AGENT_3
-from pydantic import BaseModel
 from enum import Enum
-from agent2 import Speaker
+
+from agents import Agent
+from pydantic import BaseModel
+
+from listening.agents.part1.agent2 import Speaker
+from listening.agents.part1.config import MODEL
+from listening.agents.part1.prompts import AGENT_3
 
 
 class EventType(str, Enum):

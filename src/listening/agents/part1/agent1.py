@@ -1,8 +1,10 @@
-from agents import Agent, Runner
-from config import MODEL
-from prompts import AGENT_1
-from pydantic import BaseModel
 from enum import Enum
+
+from agents import Agent
+from pydantic import BaseModel
+
+from listening.agents.part1.config import MODEL
+from listening.agents.part1.prompts import AGENT_1
 
 class Gender(str, Enum):
     WOMAN = "WOMAN"

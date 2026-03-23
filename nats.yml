@@ -1,0 +1,39 @@
+version: '3'
+
+services:
+  # NATS server with JetStream enabled (dev)
+  nats:
+    image: nats:latest
+    container_name: nats
+    command:
+      - "-js"                 # enable JetStream
+      - "-m"
+      - "8222"                # HTTP monitoring port
+      - "-sd"
+      - "/data/jetstream"     # JetStream storage dir (dev volume below)
+    ports:
+      - "4222:4222"           # client connections
+      - "6222:6222"           # cluster/route (you can ignore in dev)
+      - "8222:8222"           # monitoring UI: http://localhost:8222
+    volumes:
+      - nats-dev-data:/data/jetstream
+    networks:
+      - nats-net
+
+  # Dev toolbox to manage streams/consumers from inside Docker
+  nats-box:
+    image: natsio/nats-box:latest
+    container_name: nats-box
+    depends_on:
+      - nats
+    entrypoint: [ "/bin/sh", "-c", "sleep infinity" ]
+    environment:
+      NATS_URL: nats://nats:4222
+    networks:
+      - nats-net
+
+networks:
+  nats-net:
+
+volumes:
+  nats-dev-data:

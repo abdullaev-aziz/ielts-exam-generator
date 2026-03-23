@@ -1,17 +1,34 @@
+"""IELTS audio generator — renders TTS events to WAV and uploads to S3.
+
+Public entry points:
+- ``generate_and_upload_to_s3(script, s3_key) -> str``  (CDN URL)
+- ``_render_audio(script) -> (np.ndarray, int)``        (raw audio + sample rate)
+
+TTS models are lazy-loaded on first use via ``_ensure_initialized()``.
+"""
+
+from __future__ import annotations
+
 import io
+import logging
 import os
-import numpy as np
-import torch
-import soundfile as sf
+from pathlib import Path
+from typing import Any
+
 import boto3
+import numpy as np
+import soundfile as sf
+import torch
 from botocore.config import Config
 from qwen_tts import Qwen3TTSModel
+
 from listening.agents.part1.agent3 import IELTSTTSScript
 
-# ---------------------------
-# Qwen3-TTS setup
-# ---------------------------
-PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
+logger = logging.getLogger("ielts.audio")
+
+# ── Model configuration ──────────────────────────────────────────────────────
+
+PROJECT_ROOT = str(Path(__file__).resolve().parents[2])
 VOICE_DESIGN_MODEL_ID = os.getenv("QWEN3_TTS_VOICE_DESIGN_MODEL", "Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign")
 VOICE_CLONE_MODEL_ID = os.getenv("QWEN3_TTS_VOICE_CLONE_MODEL", "Qwen/Qwen3-TTS-12Hz-1.7B-Base")
 NARRATOR_REF_AUDIO = os.getenv("QWEN3_TTS_NARRATOR_REF_AUDIO", "narrator_ref.wav")
@@ -22,8 +39,57 @@ NARRATOR_REF_TEXT = os.getenv("QWEN3_TTS_NARRATOR_REF_TEXT", """You will hear fo
                                                                 The test is in four parts. At the end of the test, you will be given two
                                                                 minutes to check all of your answers""")
 
+REFERENCE_TEXT = "Hello, this is a test. Now you are hearring me."
+
+# Micro-pauses for realism (kept short between adjacent speech turns)
+PAUSE_TURN = 0.25
+PAUSE_NARR = 0.30
+
+# Speaker voice design instructions
+INSTR: dict[str, str] = {
+    "MAN": """gender: Male.
+    pitch: Mid-range, slightly deep.
+    speed: Slightly slowed (0.92x), natural conversational pace with gentle pauses for thought.
+    volume: Balanced, relaxed.
+    age: Young Adult.
+    clarity: High.
+    fluency: High, with natural flow.
+    accent: British.
+    texture: Warm, natural.
+    emotion: Friendly, engaged.
+    tone: Casual yet thoughtful, as if discussing ideas with a close friend.
+    personality: Approachable, genuine, conversational.
+    """,
+    "SPEAKER": """gender: Male. pitch: Low. speed: Normal (slower for numbers and letters). volume: Strong. age: Middle-aged. clarity: Very High. fluency: Very High. accent: Neutral British. texture: Rich. emotion: Authoritative. tone: Confident. personality: Commanding.""",
+    "WOMAN": """
+    gender: Female.
+    pitch: Mid-range.
+    speed: Slightly slowed (0.92x), natural conversational pace with gentle pauses for thought.
+    volume: Balanced, intimate.
+    age: Young Adult.
+    clarity: High.
+    fluency: High, with natural flow.
+    accent: British.
+    texture: Warm, natural.
+    emotion: Friendly, engaged.
+    tone: Casual yet thoughtful, as if sharing ideas with a close friend.
+    personality: Approachable, genuine, conversational.
+    """,
+}
+
+NARRATOR = "NARRATOR"
+MAN = "MAN"
+WOMAN = "WOMAN"
+
+# ── Lazy-loaded globals ──────────────────────────────────────────────────────
+
+voice_design_model: Qwen3TTSModel | None = None
+voice_clone_model: Qwen3TTSModel | None = None
+reference_prompts: dict[str, Any] | None = None
+
 
 def load_tts_model(model_id: str) -> Qwen3TTSModel:
+    """Load a Qwen3-TTS model from HuggingFace."""
     return Qwen3TTSModel.from_pretrained(
         model_id,
         dtype=torch.float32,
@@ -33,61 +99,17 @@ def load_tts_model(model_id: str) -> Qwen3TTSModel:
 
 
 def resolve_project_path(path: str) -> str:
+    """Resolve *path* relative to PROJECT_ROOT if not already absolute."""
     if os.path.isabs(path):
         return path
     return os.path.join(PROJECT_ROOT, path)
 
 
-voice_design_model = None
-voice_clone_model = None
+def build_reference_assets() -> dict[str, Any]:
+    """Generate reusable voice clone prompts for NARRATOR, MAN, and WOMAN."""
+    logger.info("Generating reference voices…")
+    prompts: dict[str, Any] = {}
 
-OUT_WAV = "ielts_part4.wav"
-REFERENCE_TEXT = "Hello, this is a test."
-
-# Micro-pauses for realism (kept short between adjacent speech turns)
-PAUSE_TURN = 0.25
-PAUSE_NARR = 0.30
-
-# Speaker instructions used for non-narrator reference generation.
-INSTR = {
-    "MAN": """gender: Male. 
-    pitch: Mid-range, slightly deep. 
-    speed: Slightly slowed (0.92x), natural conversational pace with gentle pauses for thought. 
-    volume: Balanced, relaxed. 
-    age: Young Adult. 
-    clarity: High. 
-    fluency: High, with natural flow. 
-    accent: British. 
-    texture: Warm, natural. 
-    emotion: Friendly, engaged. 
-    tone: Casual yet thoughtful, as if discussing ideas with a close friend. 
-    personality: Approachable, genuine, conversational.
-    """,
-    "SPEAKER": """gender: Male. pitch: Low. speed: Normal (slower for numbers and letters). volume: Strong. age: Middle-aged. clarity: Very High. fluency: Very High. accent: Neutral British. texture: Rich. emotion: Authoritative. tone: Confident. personality: Commanding.""",
-    "WOMAN": """
-    gender: Female. 
-    pitch: Mid-range. 
-    speed: Slightly slowed (0.92x), natural conversational pace with gentle pauses for thought. 
-    volume: Balanced, intimate. 
-    age: Young Adult. 
-    clarity: High. 
-    fluency: High, with natural flow. 
-    accent: British. 
-    texture: Warm, natural. 
-    emotion: Friendly, engaged. 
-    tone: Casual yet thoughtful, as if sharing ideas with a close friend. 
-    personality: Approachable, genuine, conversational.
-    """,
-}
-
-NARRATOR = "NARRATOR"
-MAN = "MAN"
-WOMAN = "WOMAN"
-
-def build_reference_assets():
-    print("Generating reference voices...")
-    reference_prompts = {}
-# I deleted the man and woman
     for speaker in [NARRATOR, WOMAN, MAN]:
         if speaker == NARRATOR:
             narrator_ref_audio = resolve_project_path(NARRATOR_REF_AUDIO)
@@ -105,13 +127,13 @@ def build_reference_assets():
                     ref_text = f.read().strip()
 
             use_xvector_only = not bool(ref_text)
-            reference_prompts[speaker] = voice_clone_model.create_voice_clone_prompt(
+            prompts[speaker] = voice_clone_model.create_voice_clone_prompt(
                 ref_audio=narrator_ref_audio,
                 ref_text=ref_text if ref_text else None,
                 x_vector_only_mode=use_xvector_only,
             )
             mode = "x-vector only" if use_xvector_only else "full clone"
-            print(f"  Prepared reusable prompt for {speaker} from {narrator_ref_audio} ({mode})")
+            logger.info("  Prepared reusable prompt for %s from %s (%s)", speaker, narrator_ref_audio, mode)
             continue
 
         wavs, sr = voice_design_model.generate_voice_design(
@@ -120,20 +142,18 @@ def build_reference_assets():
             instruct=INSTR[speaker],
             do_sample=False,
         )
-        reference_prompts[speaker] = voice_clone_model.create_voice_clone_prompt(
+        prompts[speaker] = voice_clone_model.create_voice_clone_prompt(
             ref_audio=(wavs[0], sr),
             ref_text=REFERENCE_TEXT,
             x_vector_only_mode=False,
         )
-        print(f"  Prepared reusable prompt for {speaker}")
+        logger.info("  Prepared reusable prompt for %s", speaker)
 
-    return reference_prompts
-
-
-reference_prompts = None
+    return prompts
 
 
-def _ensure_initialized():
+def _ensure_initialized() -> None:
+    """Lazy-load TTS models and build reference assets on first call."""
     global voice_design_model, voice_clone_model, reference_prompts
     if reference_prompts is not None:
         return
@@ -142,7 +162,7 @@ def _ensure_initialized():
     reference_prompts = build_reference_assets()
 
 
-def tts_line(text: str, speaker: str):
+def tts_line(text: str, speaker: str) -> tuple[np.ndarray, int]:
     """Generate speech with a fixed speaker reference for stable voice consistency."""
     _ensure_initialized()
     if speaker not in reference_prompts:
@@ -157,7 +177,7 @@ def tts_line(text: str, speaker: str):
     return wavs[0], sr
 
 
-def silence(sr: int, sec: float):
+def silence(sr: int, sec: float) -> np.ndarray:
     """Generate silence of specified duration."""
     return np.zeros(int(round(sr * sec)), dtype=np.float32)
 
@@ -167,17 +187,13 @@ def trim_audio_edges(
     sr: int,
     threshold: float = 0.006,
     min_keep_ms: float = 80.0,
-):
-    """
-    Trim excessive leading/trailing silence from generated TTS audio.
-    Keeps a tiny margin to avoid cutting consonants.
-    """
+) -> np.ndarray:
+    """Trim excessive leading/trailing silence from generated TTS audio."""
     if wav.size == 0:
         return wav
 
     abs_wav = np.abs(wav)
     peak = float(abs_wav.max())
-    # Adaptive threshold suppresses low-amplitude model noise that can fake long tails.
     effective_threshold = max(threshold, peak * 0.02)
     idx = np.where(abs_wav > effective_threshold)[0]
     if idx.size == 0:
@@ -189,28 +205,28 @@ def trim_audio_edges(
     return wav[start:end]
 
 
-def _render_audio(script: IELTSTTSScript):
+def _render_audio(script: IELTSTTSScript) -> tuple[np.ndarray, int]:
     """Render all TTS events and return (combined_array, sample_rate)."""
     _ensure_initialized()
     events = script.to_events()
 
-    print("Starting audio generation...")
-    print(f"Total events: {len(events)}\n")
+    logger.info("Starting audio generation… (%d events)", len(events))
 
     tmp_wav, sr = tts_line("Test.", NARRATOR)
-    print(f"Sample rate: {sr} Hz\n")
+    logger.info("Sample rate: %d Hz", sr)
 
-    segments = []
+    segments: list[np.ndarray] = []
 
     for idx, event in enumerate(events, 1):
         if event[0] is None:
             duration = event[1]
             segments.append(silence(sr, duration))
-            print(f"[{idx}/{len(events)}] Silence: {duration:.1f}s")
+            logger.debug("[%d/%d] Silence: %.1fs", idx, len(events), duration)
             continue
 
         speaker, text = event
-        print(f"[{idx}/{len(events)}] {speaker}: {text[:60]}{'...' if len(text) > 60 else ''}")
+        preview = text[:60] + ("…" if len(text) > 60 else "")
+        logger.info("[%d/%d] %s: %s", idx, len(events), speaker, preview)
 
         wav, _ = tts_line(text, speaker)
         wav = trim_audio_edges(wav, sr)
@@ -248,5 +264,5 @@ def generate_and_upload_to_s3(script: IELTSTTSScript, s3_key: str) -> str:
     cdn_url = f"{cdn_base}/{s3_key}"
 
     duration_min = combined.shape[0] / sr / 60
-    print(f"\n✓ Uploaded to S3: {cdn_url}  ({duration_min:.2f} min)")
+    logger.info("Uploaded to S3: %s  (%.2f min)", cdn_url, duration_min)
     return cdn_url

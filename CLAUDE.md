@@ -12,33 +12,47 @@ AI-powered IELTS Listening Test Generator. Uses a multi-agent pipeline to genera
 # Activate virtual environment
 source .venv/bin/activate
 
+# One-time setup (makes src/ packages importable):
+pip install -e .
+
 # REQUIRED: narrator_ref.wav must exist in the project root before running.
 # It is a 3–10s clean audio sample of a British narrator voice used for voice cloning.
 # See "narrator_ref.wav" section below.
 
-# --- NATS server mode (primary way to run) ---
-# Start the NATS server first (must be running on localhost:4222)
-# Then start the IELTS generation server:
-python nats_server.py
-# Listens on subject 'ielts.generate'. Publishes progress to 'ielts.result.{job_id}'.
+# --- NATS mode (primary way to run) ---
+# Start NATS server in Docker (JetStream enabled, persisted volume):
+docker compose -f nats.yml up -d
 
-# Send a test job (in another terminal):
-python nats_client.py
-# Prints job_id, then streams status/questions/audio/validation events as they arrive.
+# Stop NATS server:
+docker compose -f nats.yml down
+
+# Start dispatcher (receives ielts.generate, dispatches to stage workers):
+python -m workers.subscriber        # or: ielts-dispatcher
+
+# Start stage workers — each can run on a different device:
+python -m workers.worker_qna        # or: ielts-worker-qna   (needs: OpenAI API key)
+python -m workers.worker_tts        # or: ielts-worker-tts   (needs: OpenAI API key)
+python -m workers.worker_audio      # or: ielts-worker-audio  (needs: GPU + S3 credentials)
+python -m workers.worker_qa         # or: ielts-worker-qa    (needs: OpenAI API key)
+
+# Send a job and stream results:
+python -m workers.publisher          # or: ielts-publisher
+# Resumes the last incomplete job from NATS; starts a new one if the last job finished or none exist.
+
+# Resume a specific job (replay all events from the beginning):
+python -m workers.publisher <job_id>
+# Events are persisted in JetStream for 2 hours.
 
 # --- Standalone pipeline (no NATS) ---
 # run_pipeline() in main_agent.py can be called directly from Python:
 #   from listening.agents.part1.main_agent import run_pipeline
 #   cdn_url = asyncio.run(run_pipeline())
 
-# Retry audio generation from a saved JSON (skip agents, saves locally — GPU only)
-python ielts_audio_generator.py tts_events.json
-
 # Run individual agents
-python listening/agents/part1/agent1.py   # Blueprint generator
-python listening/agents/part1/agent2.py   # Question writer
-python listening/agents/part1/agent3.py   # TTS script generator
-python listening/agents/part1/agent4.py   # Quality validator
+python src/listening/agents/part1/agent1.py   # Blueprint generator
+python src/listening/agents/part1/agent2.py   # Question writer
+python src/listening/agents/part1/agent3.py   # TTS script generator
+python src/listening/agents/part1/agent4.py   # Quality validator
 ```
 
 ### narrator_ref.wav
@@ -54,21 +68,54 @@ The pipeline no longer writes local WAV or JSON files. Audio is rendered in memo
 
 ## Architecture
 
-The system uses a **sequential agent pipeline** orchestrated by `listening/agents/part1/main_agent.py`:
+The project uses a `src/` layout with `pyproject.toml` for packaging. Install with `pip install -e .`.
+
+```
+src/
+├── listening/agents/part1/     # Agent pipeline
+│   ├── config.py, prompts.py   # Configuration & prompts
+│   ├── agent1-4.py             # Individual agents
+│   └── main_agent.py           # Pipeline orchestrator
+├── audio/
+│   └── generator.py            # TTS rendering + S3 upload
+├── workers/                    # NATS workers & dispatcher
+│   ├── common.py               # Shared NATS infrastructure
+│   ├── subscriber.py           # Dispatcher
+│   ├── publisher.py            # Client
+│   └── worker_*.py             # Stage workers
+└── common/
+    └── log_config.py           # Shared logging setup
+```
+
+The system uses a **sequential agent pipeline** orchestrated by `src/listening/agents/part1/main_agent.py`:
 
 1. **Agent 1** (`agent1.py`) — Blueprint/skeleton generator. Creates an `IELTSBlueprint` Pydantic model with scenario, speakers, question groups, and planned answer fields. This is the most complete agent with a detailed prompt.
 2. **Agent 2** (`agent2.py`) — Question & answer writer. Takes the `IELTSBlueprint` from Agent 1 and generates 10 concrete questions, answers with distractors, and a full natural dialogue. Outputs an `IELTSQuestionSet` Pydantic model. Uses Cambridge distractor techniques (correction traps, spelling protocol, number confusion, decoy alternatives).
 3. **Agent 3** (`agent3.py`) — TTS script generator. Takes the `IELTSQuestionSet` from Agent 2 and blueprint speaker info from Agent 1, and produces an `IELTSTTSScript` — a complete ordered list of speech and silence events matching the IELTS Part 1 audio structure. Uses semantic `SilenceType` labels (not hardcoded durations). Applies Qwen3-TTS text formatting (ellipsis for pauses, em-dash spelling sequences, filler preservation). The `to_events()` method converts the Pydantic output to the `[(speaker, text), (None, duration)]` tuple format consumed by the audio generator.
-4. **Agent 4** (`agent4.py`) — Quality checker/validator. Validates IELTS compliance. (Stub.)
+4. **Agent 4** (`agent4.py`) — Quality checker/validator. Validates IELTS compliance against Cambridge standards. Returns an `IELTSValidation` Pydantic model with `valid` (bool), `issues` (list of strings), and `summary`.
 
-Agents use the OpenAI SDK (configured in `config.py`) via the `agents` framework (`await Runner.run()`). The pipeline is exposed as `async run_pipeline(on_progress=None) → str` in `main_agent.py`. It calls `asyncio.to_thread(generate_and_upload_to_s3, ...)` to offload blocking GPU work. Prompts live in `prompts.py`.
+Agents use the OpenAI SDK (configured in `config.py`) via the `agents` framework (`await Runner.run()`). The pipeline is split into 4 stage functions in `main_agent.py`: `run_qna_stage`, `run_tts_stage`, `run_audio_stage`, `run_qa_stage`. A convenience wrapper `run_pipeline()` calls all 4 sequentially for standalone use. Each stage function accepts an `on_progress` callback. `run_audio_stage` calls `asyncio.to_thread(generate_and_upload_to_s3, ...)` to offload blocking GPU work. Prompts live in `prompts.py`.
 
-**NATS interface** (`nats_server.py` / `nats_client.py`): The primary runtime mode.
-- `nats_server.py` — subscribes to `ielts.generate`; on each request, immediately responds with `{"job_id": "..."}` and spawns a background task (`run_job`) that calls `run_pipeline(on_progress=publish)`. Progress events are published to `ielts.result.{job_id}` with types: `status`, `questions`, `audio`, `validation`, `error`. Final event always includes `"done": true`.
-- `nats_client.py` — test client: sends a request to `ielts.generate`, then subscribes to `ielts.result.{job_id}` and prints each event until `done`.
-- NATS server must be running on `localhost:4222`.
+**Package structure**: The `src/` directory contains all Python packages. `listening/`, `audio/`, `workers/`, and `common/` are proper Python packages with `__init__.py` files. All imports are absolute (e.g., `from listening.agents.part1.config import MODEL`, `from workers.common import run_worker`). No `sys.path` hacks.
 
-**TTS audio generator** (`ielts_audio_generator.py`): Two public entry points:
+**Logging**: All modules use Python's `logging` module (no `print()` for operational output). `common.log_config.setup_logging()` configures structured console output. Logger names follow the `ielts.*` namespace (`ielts.pipeline`, `ielts.audio`, `ielts.nats`, `ielts.dispatcher`, `ielts.publisher`).
+
+Each pipeline step runs with a timeout and auto-retry (up to `MAX_RETRIES=2`). Timeouts are configured via `AGENT_TIMEOUTS` in `main_agent.py`: agent1=3min, agent2=4min, agent3=3min, audio=60min, agent4=2min. On timeout, a status event is published and the step retries; on final failure, an error is raised.
+
+**NATS interface**: The primary runtime mode. The pipeline is split into 4 independent stage workers that chain through JetStream subjects. Different workers can run on different devices.
+
+- `src/workers/common.py` — **shared NATS infrastructure**. Contains stream definitions, `ensure_streams()`, `make_progress_callback()`, and the generic `run_worker()` loop. All workers and the dispatcher import from here — no duplicated stream/loop code.
+- `src/common/log_config.py` — shared logging setup. All processes call `setup_logging()` at startup for consistent structured console output.
+- `src/workers/subscriber.py` — **dispatcher only**. Subscribes to `ielts.generate`; responds with `{"job_id": "..."}` and publishes `{"job_id": "..."}` to `ielts.stage.qna`. No agents run here.
+- `src/workers/worker_qna.py` — durable pull consumer on `ielts.stage.qna`. Runs Agent 1 + Agent 2 (`ack_wait=600s`). Publishes blueprint + question_set to `ielts.stage.tts`.
+- `src/workers/worker_tts.py` — durable pull consumer on `ielts.stage.tts`. Runs Agent 3 (`ack_wait=300s`). Publishes tts_script to `ielts.stage.audio`.
+- `src/workers/worker_audio.py` — durable pull consumer on `ielts.stage.audio`. Runs TTS + S3 upload (`ack_wait=3600s` for long GPU jobs). Publishes cdn_url to `ielts.stage.qa`.
+- `src/workers/worker_qa.py` — durable pull consumer on `ielts.stage.qa`. Runs Agent 4 (`ack_wait=300s`). Publishes final `validation` event with `done: true` to `ielts.result.{job_id}`.
+- `src/workers/publisher.py` — sends a request to `ielts.generate`, then subscribes via JetStream ordered consumer (replays all stored events from the beginning). Resume: re-run with no args (queries the last job_id from the `IELTS_RESULTS` stream) or pass an explicit job_id.
+- All workers create both streams on startup (idempotent via `workers.common.ensure_streams()`): `IELTS_STAGES` on `ielts.stage.*` and `IELTS_RESULTS` on `ielts.result.*`, both with 2-hour retention. Durable consumers provide at-least-once delivery — crashed workers get redelivery on restart.
+- Progress event types: `status`, `questions`, `audio`, `validation`, `error`. Final event always includes `"done": true`.
+
+**TTS audio generator** (`src/audio/generator.py`): Two public entry points:
 - `_render_audio(script)` — private helper, renders TTS events to a numpy array in memory
 - `generate_and_upload_to_s3(script, s3_key) → str` — renders in memory via `BytesIO`, uploads directly to S3 via `put_object`, returns the CDN URL. Called by `main_agent.py` — no local files written.
 
@@ -76,7 +123,7 @@ Uses Qwen3-TTS with voice cloning, speaker-specific voice design, silence trimmi
 
 ## Key Configuration
 
-- `listening/agents/part1/config.py` — API key (from `OPENAI_API_KEY` env var), model name (`gpt-5.4-2026-03-05`)
+- `src/listening/agents/part1/config.py` — API key (from `OPENAI_API_KEY` env var), model name (`gpt-5.4-2026-03-05`)
 - `.env` — Environment variables for API keys and S3 config (gitignored). Required S3 vars:
   - `S3_ENDPOINT_URL` — custom S3-compatible endpoint
   - `S3_REGION` — storage region
@@ -84,7 +131,8 @@ Uses Qwen3-TTS with voice cloning, speaker-specific voice design, silence trimmi
   - `S3_BUCKET_NAME` — target bucket
   - `S3_BASE_FOLDER` — key prefix (default: `dev/ielts`)
   - `S3_CDN_BASE_URL` — CDN base for returned URLs
-- `listening/agents/part1/prompts.py` — All agent system prompts (Agents 1, 2, and 3 are populated)
+- `src/listening/agents/part1/prompts.py` — All agent system prompts (Agents 1–4 are populated)
+- `pyproject.toml` — Project packaging config. Defines CLI entry points (`ielts-dispatcher`, `ielts-publisher`, `ielts-worker-*`).
 
 ## Data Models
 
@@ -94,19 +142,31 @@ Pydantic models in `agent2.py`: `IELTSQuestionSet`, `Question`, `AnswerKeyEntry`
 
 Pydantic models in `agent3.py`: `IELTSTTSScript`, `TTSEvent`, `EventType` (speech/silence), `SilenceType` (8 labels). `SILENCE_DURATIONS` maps silence labels to durations in seconds. `to_events()` converts the structured output to `[(speaker, text), (None, duration)]` tuples for the audio generator.
 
+Pydantic models in `agent4.py`: `IELTSValidation` with `valid` (bool), `issues` (list[str]), `summary` (str). Validates structure, answer quality, dialogue quality, distractor correctness, and TTS script formatting.
+
 ## Dependencies
 
 Key packages: `openai`, `openai-agents` (agent orchestration framework), `qwen-tts`, `torch`, `soundfile`, `numpy`, `pydantic`, `boto3` (S3 uploads), `nats-py` (NATS messaging), `python-dotenv` (env loading). Python 3.13.3. Pinned versions are in `requirements.txt`.
 
-Note: `nats-py` and `python-dotenv` are used by `nats_server.py` but are not yet listed in `requirements.txt` — install manually if needed: `pip install nats-py python-dotenv`.
+All dependencies including `nats-py` and `python-dotenv` are listed in `requirements.txt`.
 
 ```bash
-pip install -r requirements.txt
+pip install -e .               # installs project + dependencies from pyproject.toml
+# or:
+pip install -r requirements.txt  # dependencies only (no editable install)
 ```
 
 Note: `torch==2.2.2` in `requirements.txt` is the CPU build. For GPU inference (required for TTS), install the matching CUDA build from [pytorch.org](https://pytorch.org/get-started/locally/) instead.
 
 ## Installed Skills
+
+### NATS (`nats`)
+
+Location: `.agents/skills/nats/`
+
+Core NATS and JetStream reference — subjects, request/reply, persistence, consumers. Python, Node.js, Go, and Java examples. Also covers security (TLS, auth) and clustering.
+
+**Usage**: Reference `SKILL.md` for quick patterns and `advanced.md` for JetStream consumer setup, security config, and clustering when working on `src/workers/subscriber.py`, `src/workers/publisher.py`, or any NATS-related code.
 
 ### OpenAI Agents SDK Guidelines (`openai-agents-sdk-guidelines`)
 
@@ -148,3 +208,26 @@ Key rules:
 - Write all numbers as words; no SSML or markup tags
 
 **Usage**: Reference when writing or reviewing any TTS `text` field or `instruct` voice instruction prompt.
+
+### Superpowers (`superpowers`)
+
+Location: `.agents/skills/brainstorming/`, `.agents/skills/writing-plans/`, `.agents/skills/executing-plans/`, etc.
+
+14 workflow skills from the [superpowers plugin](https://github.com/obra/superpowers-marketplace), installed locally into `.agents/skills/`. These are **not** loaded via the plugin system — skills live directly in the repo.
+
+| Skill | When to use |
+|-------|-------------|
+| `using-superpowers` | Start of any conversation — establishes skill discovery |
+| `brainstorming` | Before any creative work / new feature |
+| `writing-plans` | Before touching code on multi-step tasks |
+| `executing-plans` | Executing a written plan with review checkpoints |
+| `subagent-driven-development` | Parallel independent tasks in current session |
+| `dispatching-parallel-agents` | 2+ independent tasks for parallel agents |
+| `test-driven-development` | Before writing implementation code |
+| `systematic-debugging` | Before proposing fixes for any bug/failure |
+| `verification-before-completion` | Before claiming work is complete or tests pass |
+| `using-git-worktrees` | Isolated feature work / before executing plans |
+| `finishing-a-development-branch` | When implementation is complete, deciding how to integrate |
+| `requesting-code-review` | After completing a feature or before merging |
+| `receiving-code-review` | When processing code review feedback |
+| `writing-skills` | When creating or editing skills |

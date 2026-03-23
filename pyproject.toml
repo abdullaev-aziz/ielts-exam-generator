@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ai-ielts"
+version = "0.1.0"
+requires-python = ">=3.11"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[project.scripts]
+ielts-dispatcher = "workers.subscriber:main"
+ielts-publisher = "workers.publisher:main"
+ielts-worker-qna = "workers.worker_qna:main"
+ielts-worker-tts = "workers.worker_tts:main"
+ielts-worker-audio = "workers.worker_audio:main"
+ielts-worker-qa = "workers.worker_qa:main"

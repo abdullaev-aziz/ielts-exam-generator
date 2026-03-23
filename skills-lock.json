@@ -1,6 +1,11 @@
 {
   "version": 1,
   "skills": {
+    "nats": {
+      "source": "claude-dev-suite/claude-dev-suite",
+      "sourceType": "github",
+      "computedHash": "52db5f0989a2eadc152c789f4fc0e0db12fc413f1b3aaada793c85909215ff4b"
+    },
     "openai-agents-sdk-guidelines": {
       "source": "flurin17/openai-agents-guidelines",
       "sourceType": "github",
