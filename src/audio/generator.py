@@ -88,13 +88,18 @@ voice_clone_model: Qwen3TTSModel | None = None
 reference_prompts: dict[str, Any] | None = None
 
 
+DEVICE = "cuda:0" if torch.cuda.is_available() else "cpu"
+DTYPE = torch.bfloat16 if DEVICE.startswith("cuda") else torch.float32
+
+
 def load_tts_model(model_id: str) -> Qwen3TTSModel:
     """Load a Qwen3-TTS model from HuggingFace."""
+    logger.info("Loading TTS model %s on %s (%s)", model_id, DEVICE, DTYPE)
     return Qwen3TTSModel.from_pretrained(
         model_id,
-        dtype=torch.float32,
-        attn_implementation="eager",
-        low_cpu_mem_usage=False,
+        dtype=DTYPE,
+        device_map=DEVICE,
+        attn_implementation="flash_attention_2" if DEVICE.startswith("cuda") else "eager",
     )
 
 
