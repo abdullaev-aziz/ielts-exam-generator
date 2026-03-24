@@ -112,7 +112,7 @@ async def run_worker(
     if consumer_cfg:
         try:
             info = await js.consumer_info(STAGES_STREAM, worker_name)
-            if info.config.ack_wait != ack_wait * 1_000_000_000:  # NATS stores nanoseconds
+            if info.config.ack_wait != ack_wait:  # nats-py uses seconds
                 logger.info("[%s] Consumer config changed — recreating.", worker_name)
                 await js.delete_consumer(STAGES_STREAM, worker_name)
         except Exception:
