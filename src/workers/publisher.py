@@ -19,7 +19,9 @@ from nats.aio.msg import Msg
 from nats.js import JetStreamContext
 
 from common.log_config import setup_logging
-from workers.common import NATS_URL, RESULTS_STREAM
+import os
+
+from workers.common import RESULTS_STREAM
 
 logger = logging.getLogger("ielts.publisher")
 
@@ -60,7 +62,7 @@ async def _async_main() -> None:
 
     job_id: str | None = sys.argv[1] if len(sys.argv) > 1 else None
 
-    nc = await nats.connect(NATS_URL)
+    nc = await nats.connect(os.environ["NATS_URL"])
     js = nc.jetstream()
 
     if not job_id:

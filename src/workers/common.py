@@ -13,10 +13,15 @@ import signal
 import traceback
 from typing import Any, Callable, Awaitable
 
+import os
+
 import nats
 import nats.js.api as js_api
+from dotenv import load_dotenv
 from nats.aio.client import Client as NatsClient
 from nats.js import JetStreamContext
+
+load_dotenv(os.path.join(os.path.dirname(__file__), os.pardir, os.pardir, ".env"))
 
 logger = logging.getLogger("ielts.nats")
 
@@ -28,7 +33,6 @@ STAGES_STREAM = "IELTS_STAGES"
 STAGES_SUBJECTS = ["ielts.stage.*"]
 STREAM_MAX_AGE = 2 * 60 * 60  # 2 hours in seconds
 
-NATS_URL = "nats://localhost:4222"
 
 
 async def ensure_streams(js: JetStreamContext) -> None:
@@ -98,7 +102,7 @@ async def run_worker(
         Consumer ``ack_wait`` in seconds.  Defaults to ``None`` (NATS default
         of 30 s). Set to a large value for long-running stages like audio.
     """
-    nc: NatsClient = await nats.connect(NATS_URL)
+    nc: NatsClient = await nats.connect(os.environ["NATS_URL"])
     js = nc.jetstream()
     await ensure_streams(js)
 

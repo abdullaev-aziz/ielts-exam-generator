@@ -15,7 +15,9 @@ import nats
 from nats.aio.msg import Msg
 
 from common.log_config import setup_logging
-from workers.common import NATS_URL, ensure_streams
+import os
+
+from workers.common import ensure_streams
 
 logger = logging.getLogger("ielts.dispatcher")
 
@@ -23,7 +25,7 @@ logger = logging.getLogger("ielts.dispatcher")
 async def _async_main() -> None:
     setup_logging()
 
-    nc = await nats.connect(NATS_URL)
+    nc = await nats.connect(os.environ["NATS_URL"])
     js = nc.jetstream()
     await ensure_streams(js)
 
