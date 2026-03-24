@@ -20,7 +20,6 @@ from listening.agents.part1.agent2 import question_agent, IELTSQuestionSet
 from listening.agents.part1.agent3 import tts_agent, IELTSTTSScript
 from listening.agents.part1.agent4 import qa_agent
 
-from audio.generator import generate_and_upload_to_s3
 
 logger = logging.getLogger("ielts.pipeline")
 
@@ -130,6 +129,8 @@ async def run_audio_stage(
     async def status(msg: str) -> None:
         if on_progress:
             await on_progress("status", {"message": msg})
+
+    from audio.generator import generate_and_upload_to_s3
 
     await status("Generating audio and uploading to S3...")
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")

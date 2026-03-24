@@ -99,7 +99,7 @@ def load_tts_model(model_id: str) -> Qwen3TTSModel:
         model_id,
         dtype=DTYPE,
         device_map=DEVICE,
-        attn_implementation="flash_attention_2" if DEVICE.startswith("cuda") else "eager",
+        attn_implementation="sdpa" if DEVICE.startswith("cuda") else "eager",
     )
 
 
@@ -110,45 +110,57 @@ def resolve_project_path(path: str) -> str:
     return os.path.join(PROJECT_ROOT, path)
 
 
-def build_reference_assets() -> dict[str, Any]:
-    """Generate reusable voice clone prompts for NARRATOR, MAN, and WOMAN."""
-    logger.info("Generating reference voices…")
-    prompts: dict[str, Any] = {}
-
-    for speaker in [NARRATOR, WOMAN, MAN]:
-        if speaker == NARRATOR:
-            narrator_ref_audio = resolve_project_path(NARRATOR_REF_AUDIO)
-            if not os.path.exists(narrator_ref_audio):
-                raise FileNotFoundError(
-                    f"Narrator reference audio not found: {narrator_ref_audio}. "
-                    "Place your sample as narrator_ref.wav in the project root, "
-                    "or set QWEN3_TTS_NARRATOR_REF_AUDIO to its path."
-                )
-
-            ref_text = NARRATOR_REF_TEXT.strip()
-            narrator_ref_text_path = resolve_project_path("narrator_ref.txt")
-            if not ref_text and os.path.exists(narrator_ref_text_path):
-                with open(narrator_ref_text_path, "r", encoding="utf-8") as f:
-                    ref_text = f.read().strip()
-
-            use_xvector_only = not bool(ref_text)
-            prompts[speaker] = voice_clone_model.create_voice_clone_prompt(
-                ref_audio=narrator_ref_audio,
-                ref_text=ref_text if ref_text else None,
-                x_vector_only_mode=use_xvector_only,
-            )
-            mode = "x-vector only" if use_xvector_only else "full clone"
-            logger.info("  Prepared reusable prompt for %s from %s (%s)", speaker, narrator_ref_audio, mode)
-            continue
-
+def _build_design_voices() -> dict[str, tuple[np.ndarray, int]]:
+    """Phase 1: use voice_design_model to synthesise reference audio for MAN/WOMAN."""
+    logger.info("Generating designed reference voices (MAN, WOMAN)…")
+    design_wavs: dict[str, tuple[np.ndarray, int]] = {}
+    for speaker in [WOMAN, MAN]:
         wavs, sr = voice_design_model.generate_voice_design(
             text=REFERENCE_TEXT,
             language="English",
             instruct=INSTR[speaker],
             do_sample=False,
         )
+        design_wavs[speaker] = (wavs[0], sr)
+        logger.info("  Designed reference audio for %s", speaker)
+    return design_wavs
+
+
+def _build_clone_voices(
+    design_wavs: dict[str, tuple[np.ndarray, int]],
+) -> dict[str, Any]:
+    """Phase 2: use voice_clone_model to create clone prompts for all speakers."""
+    logger.info("Building voice clone prompts…")
+    prompts: dict[str, Any] = {}
+
+    # NARRATOR — clone from reference wav file
+    narrator_ref_audio = resolve_project_path(NARRATOR_REF_AUDIO)
+    if not os.path.exists(narrator_ref_audio):
+        raise FileNotFoundError(
+            f"Narrator reference audio not found: {narrator_ref_audio}. "
+            "Place your sample as narrator_ref.wav in the project root, "
+            "or set QWEN3_TTS_NARRATOR_REF_AUDIO to its path."
+        )
+
+    ref_text = NARRATOR_REF_TEXT.strip()
+    narrator_ref_text_path = resolve_project_path("narrator_ref.txt")
+    if not ref_text and os.path.exists(narrator_ref_text_path):
+        with open(narrator_ref_text_path, "r", encoding="utf-8") as f:
+            ref_text = f.read().strip()
+
+    use_xvector_only = not bool(ref_text)
+    prompts[NARRATOR] = voice_clone_model.create_voice_clone_prompt(
+        ref_audio=narrator_ref_audio,
+        ref_text=ref_text if ref_text else None,
+        x_vector_only_mode=use_xvector_only,
+    )
+    mode = "x-vector only" if use_xvector_only else "full clone"
+    logger.info("  Prepared reusable prompt for %s from %s (%s)", NARRATOR, narrator_ref_audio, mode)
+
+    # MAN / WOMAN — clone from designed reference audio
+    for speaker, (wav, sr) in design_wavs.items():
         prompts[speaker] = voice_clone_model.create_voice_clone_prompt(
-            ref_audio=(wavs[0], sr),
+            ref_audio=(wav, sr),
             ref_text=REFERENCE_TEXT,
             x_vector_only_mode=False,
         )
@@ -162,9 +174,20 @@ def _ensure_initialized() -> None:
     global voice_design_model, voice_clone_model, reference_prompts
     if reference_prompts is not None:
         return
+
+    # Load voice-design model first, build reference voices, then free it
+    # before loading the clone model — keeps peak VRAM under ~4 GB.
     voice_design_model = load_tts_model(VOICE_DESIGN_MODEL_ID)
+    # Build only the design-generated voices (MAN, WOMAN) that need voice_design_model
+    _design_prompts = _build_design_voices()
+    # Free design model before loading clone model
+    del voice_design_model
+    voice_design_model = None
+    if DEVICE.startswith("cuda"):
+        torch.cuda.empty_cache()
+
     voice_clone_model = load_tts_model(VOICE_CLONE_MODEL_ID)
-    reference_prompts = build_reference_assets()
+    reference_prompts = _build_clone_voices(_design_prompts)
 
 
 def tts_line(text: str, speaker: str) -> tuple[np.ndarray, int]:

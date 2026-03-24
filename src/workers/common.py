@@ -1,6 +1,6 @@
 """Shared NATS JetStream infrastructure for all workers and the dispatcher.
 
-Centralises stream definitions, connection setup, and the worker loop pattern
+Centralizes stream definitions, connection setup, and the worker loop pattern
 so that individual worker files only need to define their processing logic.
 """
 
@@ -125,8 +125,12 @@ async def run_worker(
 
     stop = asyncio.Event()
     loop = asyncio.get_event_loop()
-    for sig in (signal.SIGINT, signal.SIGTERM):
-        loop.add_signal_handler(sig, stop.set)
+    if hasattr(loop, "add_signal_handler"):
+        try:
+            for sig in (signal.SIGINT, signal.SIGTERM):
+                loop.add_signal_handler(sig, stop.set)
+        except NotImplementedError:
+            pass
 
     while not stop.is_set():
         try:

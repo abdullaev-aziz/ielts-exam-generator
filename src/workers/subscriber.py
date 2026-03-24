@@ -40,8 +40,12 @@ async def _async_main() -> None:
 
     stop = asyncio.Event()
     loop = asyncio.get_event_loop()
-    for sig in (signal.SIGINT, signal.SIGTERM):
-        loop.add_signal_handler(sig, stop.set)
+    if hasattr(loop, "add_signal_handler"):
+        try:
+            for sig in (signal.SIGINT, signal.SIGTERM):
+                loop.add_signal_handler(sig, stop.set)
+        except NotImplementedError:
+            pass
     await stop.wait()
 
     await nc.drain()
