@@ -1,18 +1,22 @@
+import asyncio
 from enum import Enum
 
-from agents import Agent
+from agents import Agent, Runner
 from pydantic import BaseModel
 
 from listening.agents.part1.config import MODEL
 from listening.agents.part1.prompts import AGENT_1
 
+
 class Gender(str, Enum):
     WOMAN = "WOMAN"
     MAN = "MAN"
 
+
 class QuestionType(str, Enum):
     form_completion = "form_completion"
     matching = "matching"
+
 
 class QuestionGroup(BaseModel):
     part_number: int
@@ -21,9 +25,11 @@ class QuestionGroup(BaseModel):
     word_limit: int | None
     context_description: str
 
+
 class PlannedAnswerField(BaseModel):
     question_number: int
     field_type: str
+
 
 class IELTSBlueprint(BaseModel):
     topic: str
@@ -37,15 +43,29 @@ class IELTSBlueprint(BaseModel):
     question_groups: list[QuestionGroup]
     planned_answer_fields: list[PlannedAnswerField]
 
-skeleton_agent = Agent(
-    name="Skeleton Planner",
-    model=MODEL,
-    instructions=AGENT_1,
-    output_type=IELTSBlueprint
-)
 
-skeleton_tool = skeleton_agent.as_tool(
-    tool_name="generate_skeleton",
-    tool_description="Generate IELTS test skeleton"
-)
+async def create_skeleton_agent() -> Agent:
+    """Build a Skeleton Planner agent with exclusion list injected into prompt."""
+    from listening.agents.part1.history import get_exclusion_context
 
+    exclusion = await get_exclusion_context()
+    prompt = AGENT_1.replace("{exclusion_list}", exclusion)
+    return Agent(
+        name="Skeleton Planner",
+        model=MODEL,
+        instructions=prompt,
+        output_type=IELTSBlueprint,
+    )
+
+
+async def main():
+    from listening.agents.part1.history import save_blueprint
+
+    agent = await create_skeleton_agent()
+    result = await Runner.run(agent, "")
+    await save_blueprint(result.final_output)
+    print(result.final_output)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())

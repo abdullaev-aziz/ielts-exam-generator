@@ -6,4 +6,5 @@ from dotenv import load_dotenv
 load_dotenv(Path(__file__).resolve().parents[4] / ".env")
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-MODEL = "gpt-5.4-2026-03-05"
+MODEL = "gpt-5.4"
+HISTORY_DB = Path(__file__).resolve().parents[4] / "generation_history.db"

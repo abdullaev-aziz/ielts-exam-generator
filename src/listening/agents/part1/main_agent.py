@@ -15,11 +15,12 @@ from typing import Any, Callable, Awaitable
 
 from agents import Runner
 
-from listening.agents.part1.agent1 import skeleton_agent, IELTSBlueprint
+from listening.agents.part1.agent1 import create_skeleton_agent, IELTSBlueprint
+from listening.agents.part1.history import save_blueprint
 from listening.agents.part1.agent2 import question_agent, IELTSQuestionSet
 from listening.agents.part1.agent3 import tts_agent, IELTSTTSScript
 from listening.agents.part1.agent4 import qa_agent
-
+from audio.generator import generate_and_upload_to_s3
 
 logger = logging.getLogger("ielts.pipeline")
 
@@ -66,11 +67,13 @@ async def run_qna_stage(
             await on_progress("status", {"message": msg})
 
     await status("Running Agent 1 (blueprint)...")
+    agent = await create_skeleton_agent()
     r1 = await _run_with_retry(
-        lambda: Runner.run(skeleton_agent, "Create IELTS Part 1 listening test"),
+        lambda: Runner.run(agent, "Create IELTS Part 1 listening test"),
         "agent1", on_progress,
     )
     blueprint: IELTSBlueprint = r1.final_output
+    await save_blueprint(blueprint)
     await status("Agent 1 done. Running Agent 2 (questions & answers)...")
 
     r2 = await _run_with_retry(
@@ -129,8 +132,6 @@ async def run_audio_stage(
     async def status(msg: str) -> None:
         if on_progress:
             await on_progress("status", {"message": msg})
-
-    from audio.generator import generate_and_upload_to_s3
 
     await status("Generating audio and uploading to S3...")
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
