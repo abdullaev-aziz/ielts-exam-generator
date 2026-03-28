@@ -11,10 +11,11 @@ AI-powered IELTS Listening Test Generator. Uses a multi-agent pipeline to genera
 - **Setup**: `source .venv/bin/activate && pip install -e .`
 - **Run (NATS)**: `docker compose -f nats.yml up -d` then start workers (see `.claude/rules/running.md`)
 - **Run (standalone)**: `from listening.agents.part1.main_agent import run_pipeline`
-- **Python**: 3.13.3 | **Model**: `gpt-5.4-2026-03-05`
+- **Python**: 3.13.3 | **Model**: `gpt-5.4`
 - **All imports are absolute** — no `sys.path` hacks
 - **All logging via `logging` module** — no `print()`, `ielts.*` namespace
 - **No local file writes** — audio rendered in memory, uploaded to S3
+- **Blueprint history** in PostgreSQL (`DATABASE_URL` env var) — Agent 1 exclusion list for variety
 
 ## Rules
 

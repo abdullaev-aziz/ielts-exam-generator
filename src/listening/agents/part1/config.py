@@ -7,4 +7,4 @@ load_dotenv(Path(__file__).resolve().parents[4] / ".env")
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 MODEL = "gpt-5.4"
-HISTORY_DB = Path(__file__).resolve().parents[4] / "generation_history.db"
+DATABASE_URL = os.getenv("DATABASE_URL")

@@ -7,6 +7,7 @@ src/
 ├── listening/agents/part1/     # Agent pipeline
 │   ├── config.py, prompts.py   # Configuration & prompts
 │   ├── agent1-4.py             # Individual agents
+│   ├── history.py              # Blueprint history (PostgreSQL, exclusion list)
 │   └── main_agent.py           # Pipeline orchestrator
 ├── audio/
 │   └── generator.py            # TTS rendering + S3 upload
@@ -25,9 +26,10 @@ The `src/` directory contains all Python packages. `listening/`, `audio/`, `work
 
 ## Key Configuration
 
-- `src/listening/agents/part1/config.py` — API key (from `OPENAI_API_KEY` env var), model name (`gpt-5.4-2026-03-05`)
+- `src/listening/agents/part1/config.py` — API key (from `OPENAI_API_KEY` env var), model name (`gpt-5.4`), `DATABASE_URL`
 - `.env` — Environment variables for API keys, NATS, and S3 config (gitignored). Required NATS var:
   - `NATS_URL` — NATS server URL (e.g. `nats://localhost:4222`)
+  - `DATABASE_URL` — PostgreSQL connection string for blueprint history (e.g. `postgresql://user:pass@host:5432/ielts`)
 - Required S3 vars:
   - `S3_ENDPOINT_URL` — custom S3-compatible endpoint
   - `S3_REGION` — storage region
